@@ -15,7 +15,10 @@ from typing import Generator, Optional, List, Tuple
 
 from llama_cpp import Llama
 
-DB_PATH = Path("chat_history.db")
+import os
+
+DB_PATH = Path(os.getenv("CHAT_DB_PATH", "chat_history.db"))
+MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "")
 
 
 @dataclass
@@ -39,8 +42,12 @@ class ChatEngine:
 
         Args:
             model_path: Path to GGUF model file or Hugging Face repo ID.
-                       If None, uses the default Qwen3-0.6B model.
+                       If None, uses env var CHAT_MODEL_PATH or default Qwen3-0.6B.
         """
+        # Use environment variable if no explicit path given
+        if model_path is None:
+            model_path = MODEL_PATH
+
         if model_path:
             self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
         else:

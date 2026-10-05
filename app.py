@@ -15,6 +15,8 @@ def load_model_from_url(model_url: str):
         return "⚠️ Veuillez entrer un repo ID Hugging Face ou un chemin de modèle.", ""
     try:
         engine.set_model(model_url.strip())
+        # Save path to env var for persistence across restarts
+        os.environ["CHAT_MODEL_PATH"] = model_url.strip()
         return f"✅ Modèle chargé : {model_url.strip()}", model_url.strip()
     except Exception as e:
         return f"❌ Erreur lors du chargement : {str(e)}", ""
@@ -95,7 +97,8 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft(), css="""
             model_status = gr.Textbox(label="État du modèle", interactive=False, scale=2)
 
             gr.Markdown("---")
-            gr.Markdown("**Modèle par défaut** : MaziyarPanahi/Qwen3-0.6B-GGUF")
+            gr.Markdown("**Modèle par défaut** : MaziyarPanahi/Qwen3-0.6B-GGUF · "
+                        "<span style='font-size: 0.7em; color: #666;'>Env: Debian proot VPS Android</span>")
 
         with gr.Column(scale=3):
             chatbot = gr.Chatbot(
