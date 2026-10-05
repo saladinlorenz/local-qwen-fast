@@ -5,7 +5,7 @@ A lightweight, 100% Python chat application with Qwen3-0.6B running locally. Fea
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-## Features
+## 🚀 Features
 
 - **100% Local & Private**: No external APIs, no Ollama, no cloud dependencies
 - **Lightweight**: Uses quantized GGUF model (~400MB RAM)
@@ -14,20 +14,23 @@ A lightweight, 100% Python chat application with Qwen3-0.6B running locally. Fea
 - **Multi-Conversation**: Create, switch, and delete multiple chat sessions
 - **REST API**: Optional FastAPI server with OpenAI-compatible endpoints
 - **Advanced Controls**: Temperature, max tokens, top-p, repeat penalty
-- **Easy Setup**: Install and run in minutes
+- **Custom Model Loader**: Load any Hugging Face repo ID or local .gguf file at runtime
+- **Proot/VPS Ready**: Environment variable configuration for Debian on Android VPS
+- **Env Var Persistence**: Model/DB paths saved across restarts
 
-## Installation
+## 📦 Installation
 
 ### Prerequisites
 
 - Python 3.10 or higher
 - pip
+- (On Android VPS with proot): Debian environment with llama-cpp-python dependencies
 
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/qwen3-local-chat.git
-cd qwen3-local-chat
+git clone https://github.com/saladinlorenz/local-qwen-fast.git
+cd local-qwen-fast
 ```
 
 ### Step 2: Create Virtual Environment (Recommended)
@@ -43,7 +46,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Quick Start
+## 🛠️ Quick Start
 
 ### Option 1: Chat Interface Only
 
@@ -65,7 +68,7 @@ Terminal 2 (Chat Interface):
 python src/app.py
 ```
 
-## Usage
+## 💡 Usage
 
 ### Chat Interface
 
@@ -77,6 +80,14 @@ python src/app.py
    - Create new discussions
    - Delete old conversations
 5. Adjust advanced parameters in the "Advanced Settings" accordion
+
+### 🤖 Custom Model Loading (NEW)
+
+The interface now supports loading custom models at runtime:
+
+**Enter a Hugging Face repo ID** (e.g., `username/model-name`) or a **local file path** to a `.gguf` model, then click **"Charger le modèle"**.
+
+The model path is automatically saved via environment variable `CHAT_MODEL_PATH` for persistence across restarts.
 
 ### REST API
 
@@ -120,16 +131,33 @@ curl -X DELETE http://127.0.0.1:8000/conversation/1
 
 Open **http://127.0.0.1:8000/docs** for Swagger UI interactive documentation.
 
-## Configuration
+## ⚙️ Configuration
 
-### Model Selection
+### Environment Variables
+
+The app supports environment variable configuration for Proot/VPS deployments:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHAT_MODEL_PATH` | (empty) | Path to GGUF file or Hugging Face repo ID. Loads at startup if set. |
+| `CHAT_DB_PATH` | `chat_history.db` | Path to SQLite database file. |
+
+#### Example for Debian/proot/VPS Android:
+
+```bash
+export CHAT_MODEL_PATH="MaziyarPanahi/Qwen3-0.6B-GGUF"
+export CHAT_DB_PATH="/data/chat_history.db"
+python src/app.py
+```
+
+### Model Selection (Default)
 
 By default, the app downloads `qwen3-0.6b-q4_k_m.gguf` from Hugging Face. You can change this in `src/engine.py`:
 
 ```python
 self.llm = Llama.from_pretrained(
     repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
-    filename="qwen3-0.6b-q4_k_m.gguf",  # Change this
+    filename="qwen3-0.6b-q4_k_m.gguf",
     n_ctx=4096,
     verbose=False,
 )
@@ -143,14 +171,11 @@ Available quantizations:
 
 ### Custom Model Path
 
-If you already have a GGUF file locally:
+If you already have a GGUF file locally, set `CHAT_MODEL_PATH` to its path:
 
-```python
-self.llm = Llama(
-    model_path="/path/to/your/model.gguf",
-    n_ctx=4096,
-    verbose=False,
-)
+```bash
+export CHAT_MODEL_PATH="/path/to/your/model.gguf"
+python src/app.py
 ```
 
 ### Port Configuration
@@ -158,18 +183,21 @@ self.llm = Llama(
 Change ports in `src/app.py` and `src/api.py`:
 
 ```python
-demo.launch(server_name="127.0.0.1", server_port=7860)  # Gradio
-uvicorn.run(app, host="127.0.0.1", port=8000)           # FastAPI
+# Gradio
+demo.launch(server_name="127.0.0.1", server_port=7860)
+
+# FastAPI  
+uvicorn.run(app, host="127.0.0.1", port=8000)
 ```
 
-## Project Structure
+## 📁 Project Structure
 
 ```
-qwen3-local-chat/
+local-qwen-fast/
 ├── src/
 │   ├── __init__.py
-│   ├── engine.py       # Core chat engine + SQLite
-│   ├── app.py          # Gradio chat interface
+│   ├── engine.py       # Core chat engine + SQLite + model loader
+│   ├── app.py          # Gradio chat interface with custom model UI
 │   └── api.py          # FastAPI REST server
 ├── requirements.txt
 ├── README.md
@@ -180,7 +208,7 @@ qwen3-local-chat/
 └── .gitignore
 ```
 
-## Technical Details
+## 🔧 Technical Details
 
 ### Dependencies
 
@@ -188,7 +216,7 @@ qwen3-local-chat/
 - **gradio**: Modern chat UI
 - **fastapi**: REST API framework
 - **uvicorn**: ASGI server
-- **aiosqlite**: Async SQLite support
+- **sqlite3**: Local database (no external package needed)
 
 ### Database Schema
 
@@ -212,40 +240,27 @@ Two tables in `chat_history.db`:
 - Base Python + deps: ~200MB RAM
 - **Total: ~600MB RAM** (varies by system)
 
-## Example: Python Client
+### Mobile & Proot Compatibility
 
-```python
-import requests
+- Designed to work on **Android VPS with proot + Debian**
+- CSS media queries adapt interface for desktop & mobile browsers
+- Environment variables allow paths outside default directory
+- SQLite database stored locally in proot filesystem
 
-# Send a message
-response = requests.post(
-    "http://127.0.0.1:8000/chat",
-    json={
-        "message": "What is machine learning?",
-        "temperature": 0.7,
-        "max_tokens": 256
-    }
-)
-
-data = response.json()
-print(f"Conversation ID: {data['conversation_id']}")
-print(f"Answer: {data['answer']}")
-```
-
-## Troubleshooting
+## 🐛 Troubleshooting
 
 ### Issue: Model download fails
 
-**Solution**: Manually download the GGUF file from Hugging Face and place it in the project directory, then update `engine.py` to use `model_path` instead of `from_pretrained`.
+**Solution**: Manually download the GGUF file from Hugging Face and place it in the project directory, then set `CHAT_MODEL_PATH` to its local path.
 
 ### Issue: Out of memory
 
-**Solution**: Use a smaller quantization (e.g., `q2_k` or `q3_k_m`) or reduce `n_ctx` in `engine.py`.
+**Solution**: Use a smaller quantization (e.g., `q2_k` or `q3_k_m`) or reduce `n_ctx` in `engine.py` or via `CHAT_MODEL_PATH` env var.
 
 ### Issue: Slow responses
 
-**Solution**: 
-- Use GPU if available (llama-cpp-python supports CUDA/Metal)
+**Solution**:
+- Use GPU if available (llama-cpp-python supports CUDA/Metal on compatible hardware)
 - Reduce `max_tokens` parameter
 - Use a smaller quantization
 
@@ -256,21 +271,25 @@ print(f"Answer: {data['answer']}")
 demo.launch(server_name="127.0.0.1", server_port=7861)  # Use different port
 ```
 
-## License
+### Issue: Custom model not loading on restart
+
+**Solution**: Ensure `CHAT_MODEL_PATH` env var is set before launching, or use the UI "Charger le modèle" button which saves the path automatically.
+
+## 📄 License
 
 MIT License - See [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
+## 🙏 Acknowledgments
 
 - [Qwen Team](https://github.com/QwenLM/Qwen3) for the Qwen3-0.6B model
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) for GGUF format and inference
 - [Gradio](https://gradio.app/) for the chat interface
 - [FastAPI](https://fastapi.tiangolo.com/) for the REST API
 
-## Contact
+## 📬 Contact
 
 For issues, questions, or contributions, please open a GitHub issue or pull request.
 
 ---
 
-**Built with ❤️ for local AI enthusiasts**
+**Built with ❤️ for local AI enthusiasts - now with Proot/VPS support!**
