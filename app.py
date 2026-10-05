@@ -6,6 +6,18 @@ Run with: python src/app.py
 
 import gradio as gr
 from engine import engine
+import os
+
+
+def load_model_from_url(model_url: str):
+    """Load a model from Hugging Face repo ID or local path."""
+    if not model_url or not model_url.strip():
+        return "⚠️ Veuillez entrer un repo ID Hugging Face ou un chemin de modèle.", ""
+    try:
+        engine.set_model(model_url.strip())
+        return f"✅ Modèle chargé : {model_url.strip()}", model_url.strip()
+    except Exception as e:
+        return f"❌ Erreur lors du chargement : {str(e)}", ""
 
 
 def load_conversation_list():
@@ -46,7 +58,16 @@ def chat_stream(message: str, history: list, cid: int, temp: float, max_tok: int
         yield history + [{"role": "assistant", "content": full}], cid
 
 
-with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft(), css="""
+    .gradio-container {
+        max-width: 100% !important;
+    }
+    @media (max-width: 768px) {
+        .gr .wrap > .gradio-space {
+            flex-direction: column-reverse !important;
+        }
+    }
+""") as demo:
     gr.Markdown("# Qwen3-0.6B Local Chat")
     gr.Markdown("A lightweight, 100% Python chat application with persistent history and streaming responses.")
 
@@ -61,6 +82,20 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft()) as demo:
             gr.Markdown("**Model**: Qwen3-0.6B (GGUF)")
             gr.Markdown("**Backend**: llama-cpp-python")
             gr.Markdown("**Storage**: SQLite")
+
+            # Modèle Hugging Face personnalisé
+            gr.Markdown("**Modèle personnalisé**")
+            model_url_input = gr.Textbox(
+                label="Repo ID Hugging Face ou chemin de modèle",
+                placeholder="ex: utilisateur/nom-modele ou chemin/local.gguf",
+                value="",
+                scale=4,
+            )
+            load_model_btn = gr.Button("Charger le modèle", variant="secondary")
+            model_status = gr.Textbox(label="État du modèle", interactive=False, scale=2)
+
+            gr.Markdown("---")
+            gr.Markdown("**Modèle par défaut** : MaziyarPanahi/Qwen3-0.6B-GGUF")
 
         with gr.Column(scale=3):
             chatbot = gr.Chatbot(
@@ -97,6 +132,12 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft()) as demo:
                     label="Repeat Penalty",
                     info="Higher = less repetition"
                 )
+
+    load_model_btn.click(
+        fn=load_model_from_url,
+        inputs=model_url_input,
+        outputs=[model_status, model_url_input],
+    )
 
     def refresh_conv_list():
         """Refresh conversation dropdown."""

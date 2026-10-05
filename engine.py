@@ -38,7 +38,8 @@ class ChatEngine:
         Initialize the chat engine.
 
         Args:
-            model_path: Path to GGUF model file. If None, downloads from Hugging Face.
+            model_path: Path to GGUF model file or Hugging Face repo ID.
+                       If None, uses the default Qwen3-0.6B model.
         """
         if model_path:
             self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
@@ -49,7 +50,13 @@ class ChatEngine:
                 n_ctx=4096,
                 verbose=False,
             )
+        self._model_path = model_path
         self._init_db()
+
+    def set_model(self, model_path: str):
+        """Change the model at runtime."""
+        self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
+        self._model_path = model_path
 
     def _init_db(self):
         """Initialize SQLite database with required tables."""
