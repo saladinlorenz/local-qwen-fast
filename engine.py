@@ -18,7 +18,10 @@ from llama_cpp import Llama
 import os
 
 DB_PATH = Path(os.getenv("CHAT_DB_PATH", "chat_history.db"))
-MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "")
+# Modèle par défaut : Qwen3-0.6B-Q4_K_M.gguf inclus dans le repo
+# Peut être écrasé par l'env CHAT_MODEL_PATH ou l'interface UI
+DEFAULT_MODEL = "Qwen3-0.6B-Q4_K_M.gguf"
+MODEL_PATH = os.getenv("CHAT_MODEL_PATH", DEFAULT_MODEL)
 
 
 @dataclass
@@ -42,9 +45,9 @@ class ChatEngine:
 
         Args:
             model_path: Path to GGUF model file or Hugging Face repo ID.
-                       If None, uses env var CHAT_MODEL_PATH or default Qwen3-0.6B.
+                       If None, uses default model from env var or bundled file.
         """
-        # Use environment variable if no explicit path given
+        # Use explicit argument, env var, or default bundled model
         if model_path is None:
             model_path = MODEL_PATH
 
