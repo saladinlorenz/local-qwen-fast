@@ -1,0 +1,1 @@
+"""Qwen3-0.6B Local Chat - A lightweight local chat application."""\n\n__version__ = "1.0.0"\n__author__ = "LAHOUARI BENABDERRAHMANE"\n
