@@ -53,7 +53,7 @@ class ChatEngine:
         else:
             self.llm = Llama.from_pretrained(
                 repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
-                filename="qwen3-0.6b-q4_k_m.gguf",
+                filename="Qwen3-0.6B.Q4_K_M.gguf",
                 n_ctx=4096,
                 verbose=False,
             )
