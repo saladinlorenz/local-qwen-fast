@@ -202,7 +202,7 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
 
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "7860"))  # Port par défaut Gradio
     demo.launch(
         server_name="0.0.0.0",
         server_port=port,

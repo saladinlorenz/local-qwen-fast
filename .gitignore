@@ -46,4 +46,4 @@ env/
 Thumbs.db
 
 # Model files (optional)
-# *.gguf
+*.gguf

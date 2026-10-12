@@ -56,7 +56,7 @@ class ChatEngine:
         else:
             self.llm = Llama.from_pretrained(
                 repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
-                filename="Qwen3-0.6B.Q4_K_M.gguf",
+                filename="Qwen3-0.6B-Q4_K_M.gguf",
                 n_ctx=4096,
                 verbose=False,
             )
@@ -118,7 +118,15 @@ class ChatEngine:
         )
         rows = cur.fetchall()
         conn.close()
-        return [Message(role=r[0], content=r[1], timestamp=r[2]) for r in rows]
+        # Filtrer les messages contenant des références image (modèle texte uniquement)
+        filtered_rows = []
+        for r in rows:
+            content = r[1] if len(r) > 1 else ""
+            # Sauter les messages dont le contenu contient .png, .jpg ou des liens http
+            if content and (".png" in content or ".jpg" in content or content.startswith("http")):
+                continue  # On ignore ce message problématique
+            filtered_rows.append(r)
+        return [Message(role=r[0], content=r[1], timestamp=r[2]) for r in filtered_rows]
 
     def save_message(self, conversation_id: int, message: Message):
         """Save a message to the database."""
