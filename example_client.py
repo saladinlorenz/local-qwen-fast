@@ -37,6 +37,32 @@ def chat(message: str, conversation_id: int = None, temperature: float = 0.7):
     return data["conversation_id"], data["answer"]
 
 
+def chat_stream(message: str, conversation_id: int = None, temperature: float = 0.7):
+    """Streaming SSE : affiche les chunks au fur et à mesure. curl équivalent : curl -N POST /chat/stream."""
+    import json
+    payload = {"message": message, "temperature": temperature, "max_tokens": 512}
+    if conversation_id is not None:
+        payload["conversation_id"] = conversation_id
+    full = ""
+    cid = conversation_id
+    with requests.post(f"{API_URL}/chat/stream", json=payload, stream=True) as r:
+        r.raise_for_status()
+        for line in r.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            obj = json.loads(data)
+            if "conversation_id" in obj:
+                cid = obj["conversation_id"]
+            if "chunk" in obj:
+                print(obj["chunk"], end="", flush=True)
+                full += obj["chunk"]
+    print()
+    return cid, full
+
+
 def list_conversations():
     """List all conversations."""
     response = requests.get(f"{API_URL}/conversations")

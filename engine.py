@@ -1,27 +1,39 @@
 """
 Core chat engine with SQLite persistence.
 
-This module handles:
-- Model loading (llama-cpp-python)
-- Conversation management (SQLite)
-- Streaming chat completions
+- Model loading (llama-cpp-python) optimisé VPS : n_ctx réduit, threads auto
+- System prompt FR + fenêtre glissante (pas de dépassement contexte)
+- SQLite WAL + index
 """
 
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, Optional, List, Tuple
+from typing import Generator, Optional, List, Tuple, Dict
 
 from llama_cpp import Llama
 
 import os
 
 DB_PATH = Path(os.getenv("CHAT_DB_PATH", "chat_history.db"))
-# Modèle par défaut : Qwen3-0.6B-Q4_K_M.gguf inclus dans le repo
-# Peut être écrasé par l'env CHAT_MODEL_PATH ou l'interface UI
-DEFAULT_MODEL = "Qwen3-0.6B-Q4_K_M.gguf"
+_DEFAULT_CANDIDATES = [
+    Path(os.getenv("CHAT_MODEL_PATH", "")) if os.getenv("CHAT_MODEL_PATH") else None,
+    Path("Qwen3-0.6B-Q4_K_M.gguf"),
+    Path("models/Qwen3-0.6B-Q4_K_M.gguf"),
+]
+DEFAULT_MODEL = next((str(p) for p in _DEFAULT_CANDIDATES if p is not None and p.is_file()), "Qwen3-0.6B-Q4_K_M.gguf")
 MODEL_PATH = os.getenv("CHAT_MODEL_PATH", DEFAULT_MODEL)
+
+# --- Réglages faciles (env overridable) ---
+N_CTX = int(os.getenv("CHAT_N_CTX", "2048"))  # 4096 -> 2048 = ~2x plus rapide, suffisant pour 0.6B
+N_THREADS = int(os.getenv("CHAT_THREADS", str(os.cpu_count() or 4)))
+N_BATCH = int(os.getenv("CHAT_BATCH", "256"))
+MAX_HISTORY_MESSAGES = int(os.getenv("CHAT_HISTORY", "20"))  # fenêtre glissante
+SYSTEM_PROMPT = os.getenv(
+    "CHAT_SYSTEM",
+    "Tu es Qwen3, un assistant utile, concis et amical. Réponds en français sauf si l'utilisateur écrit dans une autre langue. Réponses courtes par défaut, détaillées si demandé.",
+)
 
 
 @dataclass
@@ -32,47 +44,72 @@ class Message:
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
-class ChatEngine:
-    """
-    Main chat engine class.
+def _llama_kwargs() -> Dict:
+    return dict(n_ctx=N_CTX, n_threads=N_THREADS, n_batch=N_BATCH, verbose=False)
 
-    Handles model inference, conversation storage, and message streaming.
-    """
+
+class ChatEngine:
+    """Main chat engine class."""
 
     def __init__(self, model_path: Optional[str] = None):
-        """
-        Initialize the chat engine.
-
-        Args:
-            model_path: Path to GGUF model file or Hugging Face repo ID.
-                       If None, uses default model from env var or bundled file.
-        """
-        # Use explicit argument, env var, or default bundled model
         if model_path is None:
             model_path = MODEL_PATH
-
-        if model_path:
-            self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
-        else:
-            self.llm = Llama.from_pretrained(
-                repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
-                filename="Qwen3-0.6B-Q4_K_M.gguf",
-                n_ctx=4096,
-                verbose=False,
-            )
         self._model_path = model_path
+        self.llm = self._load_llm(model_path)
         self._init_db()
+
+    def _load_llm(self, model_path: Optional[str]):
+        kw = _llama_kwargs()
+        if model_path:
+            p = Path(str(model_path))
+            if p.suffix == ".gguf" and not p.is_file():
+                # fichier local manquant -> fallback HF (ex: models/Qwen3-0.6B-Q4_K_M.gguf absent)
+                pass
+            elif p.is_file() or p.suffix == ".gguf":
+                try:
+                    return Llama(model_path=str(model_path), **kw)
+                except Exception:
+                    pass
+            # Repo ID HuggingFace ("user/repo") ou fallback
+            if "/" in str(model_path) and not Path(str(model_path)).exists():
+                # Heuristique : "repo" seul -> repo Qwen par défaut
+                repo = str(model_path)
+                filename = os.getenv("CHAT_MODEL_FILE", "Qwen3-0.6B-Q4_K_M.gguf")
+                try:
+                    return Llama.from_pretrained(repo_id=repo, filename=filename, **kw)
+                except Exception:
+                    pass
+            # Dernier essai : chemin direct (erreur explicite si échec)
+            try:
+                return Llama(model_path=str(model_path), **kw)
+            except Exception:
+                pass
+        return Llama.from_pretrained(
+            repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
+            filename="Qwen3-0.6B-Q4_K_M.gguf",
+            **kw,
+        )
 
     def set_model(self, model_path: str):
         """Change the model at runtime."""
-        self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
-        self._model_path = model_path
+        self.llm = self._load_llm(model_path.strip())
+        self._model_path = model_path.strip()
+
+    # ---------- DB ----------
+    def _connect(self):
+        conn = sqlite3.connect(DB_PATH)
+        # WAL = lectures non bloquantes (Gradio + API en parallèle), durable et rapide
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        return conn
 
     def _init_db(self):
         """Initialize SQLite database with required tables."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = self._connect()
         cur = conn.cursor()
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +117,6 @@ class ChatEngine:
                 created_at TEXT
             )
         """)
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,13 +127,15 @@ class ChatEngine:
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
             )
         """)
-
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_conv
+            ON messages(conversation_id, id)
+        """)
         conn.commit()
         conn.close()
 
     def new_conversation(self, title: str = "New Conversation") -> int:
-        """Create a new conversation."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = self._connect()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO conversations (title, created_at) VALUES (?, ?)",
@@ -108,32 +146,34 @@ class ChatEngine:
         conn.close()
         return cid
 
-    def load_conversation(self, conversation_id: int) -> List[Message]:
-        """Load all messages from a conversation."""
-        conn = sqlite3.connect(DB_PATH)
+    def load_conversation(self, conversation_id: int, limit: Optional[int] = None) -> List[Message]:
+        conn = self._connect()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id",
-            (conversation_id,),
-        )
-        rows = cur.fetchall()
+        if limit:
+            cur.execute(
+                "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+                (conversation_id, limit),
+            )
+            rows = list(reversed(cur.fetchall()))
+        else:
+            cur.execute(
+                "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id",
+                (conversation_id,),
+            )
+            rows = cur.fetchall()
         conn.close()
-        # Filtrer les messages contenant des références image (modèle texte uniquement)
-        filtered_rows = []
+        out = []
         for r in rows:
             content = r[1] if len(r) > 1 else ""
-            # Sauter les messages dont le contenu contient .png, .jpg ou des liens http
             if content and (".png" in content or ".jpg" in content or content.startswith("http")):
-                continue  # On ignore ce message problématique
-            filtered_rows.append(r)
-        return [Message(role=r[0], content=r[1], timestamp=r[2]) for r in filtered_rows]
+                continue
+            out.append(Message(role=r[0], content=r[1], timestamp=r[2] if len(r) > 2 else ""))
+        return out
 
     def save_message(self, conversation_id: int, message: Message):
-        """Save a message to the database."""
-        # Filtrer les messages contenant des références image
         if message.content and (".png" in message.content or ".jpg" in message.content or message.content.startswith("http")):
-            return  # On ignore les messages image
-        conn = sqlite3.connect(DB_PATH)
+            return
+        conn = self._connect()
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
@@ -143,8 +183,7 @@ class ChatEngine:
         conn.close()
 
     def list_conversations(self) -> List[Tuple[int, str, str]]:
-        """List all conversations."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = self._connect()
         cur = conn.cursor()
         cur.execute("SELECT id, title, created_at FROM conversations ORDER BY id DESC")
         rows = cur.fetchall()
@@ -152,8 +191,7 @@ class ChatEngine:
         return rows
 
     def delete_conversation(self, conversation_id: int):
-        """Delete a conversation and all its messages."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = self._connect()
         cur = conn.cursor()
         cur.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         cur.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
@@ -161,15 +199,29 @@ class ChatEngine:
         conn.close()
 
     def update_conversation_title(self, conversation_id: int, title: str):
-        """Update the title of a conversation."""
-        conn = sqlite3.connect(DB_PATH)
+        conn = self._connect()
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE conversations SET title = ? WHERE id = ?",
-            (title, conversation_id),
-        )
+        cur.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
         conn.commit()
         conn.close()
+
+    def export_text(self, conversation_id: int) -> str:
+        msgs = self.load_conversation(conversation_id)
+        lines = [f"# Conversation {conversation_id}", ""]
+        for m in msgs:
+            lines.append(f"**{m.role}** ({m.timestamp}):\n{m.content}\n")
+        return "\n".join(lines)
+
+    # ---------- Inference ----------
+    def _build_messages(self, history: List[Message], user_text: str) -> List[Dict]:
+        """System FR + fenêtre glissante anti-dépassement n_ctx."""
+        window = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
+        messages: List[Dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for m in window:
+            if m.role in ("user", "assistant", "system") and m.content and m.content.strip():
+                messages.append({"role": m.role, "content": m.content})
+        messages.append({"role": "user", "content": user_text})
+        return messages
 
     def stream_chat(
         self,
@@ -180,37 +232,79 @@ class ChatEngine:
         top_p: float = 0.9,
         repeat_penalty: float = 1.1,
     ) -> Generator[str, None, None]:
-        """Stream a chat completion."""
+        """Stream a chat completion. Lève une erreur claire si le modèle échoue."""
         history = self.load_conversation(conversation_id)
-        messages = [{"role": m.role, "content": m.content} for m in history]
+        messages = self._build_messages(history, user_text)
 
-        user_msg = Message(role="user", content=user_text)
-        messages.append({"role": "user", "content": user_text})
-        self.save_message(conversation_id, user_msg)
-
+        self.save_message(conversation_id, Message(role="user", content=user_text))
         if len(history) == 0:
             title = user_text[:50] + ("..." if len(user_text) > 50 else "")
             self.update_conversation_title(conversation_id, title)
 
-        completion = self.llm.create_chat_completion(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            repeat_penalty=repeat_penalty,
-            stream=True,
-        )
+        try:
+            completion = self.llm.create_chat_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                repeat_penalty=repeat_penalty,
+                stream=True,
+            )
+        except Exception as e:
+            yield f"\n❌ Erreur modèle : {e}"
+            return
 
         full_answer = ""
-        for part in completion:
-            delta = part["choices"][0].get("delta", {})
-            content = delta.get("content", "") or ""
-            if content:
-                full_answer += content
-                yield content
+        try:
+            for part in completion:
+                delta = part["choices"][0].get("delta", {})
+                content = delta.get("content", "") or ""
+                if content:
+                    full_answer += content
+                    yield content
+        except Exception as e:
+            err = f"\n\n⚠️ Génération interrompue : {e}"
+            full_answer += err
+            yield err
 
-        assistant_msg = Message(role="assistant", content=full_answer)
-        self.save_message(conversation_id, assistant_msg)
+        self.save_message(conversation_id, Message(role="assistant", content=full_answer))
+
+    def regenerate_last(
+        self,
+        conversation_id: int,
+        temperature: float = 0.7,
+        max_tokens: int = 512,
+        top_p: float = 0.9,
+        repeat_penalty: float = 1.1,
+    ) -> Generator[str, None, None]:
+        """Supprime la dernière réponse assistant et régénère. Le dernier message user est réutilisé."""
+        history = self.load_conversation(conversation_id)
+        if not history:
+            yield ""
+            return
+        # Retire le dernier assistant (et garde le dernier user comme prompt)
+        last_user = None
+        for m in reversed(history):
+            if m.role == "user":
+                last_user = m.content
+                break
+        if last_user is None:
+            yield ""
+            return
+        conn = self._connect()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'assistant')",
+            (conversation_id,),
+        )
+        # Retire aussi le doublon user qui va être re-sauvé par stream_chat
+        cur.execute(
+            "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'user' AND content = ?)",
+            (conversation_id, last_user),
+        )
+        conn.commit()
+        conn.close()
+        yield from self.stream_chat(conversation_id, last_user, temperature, max_tokens, top_p, repeat_penalty)
 
 
 engine = ChatEngine()

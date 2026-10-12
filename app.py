@@ -1,12 +1,13 @@
 """
 Gradio chat interface.
 
-Run with: python src/app.py
+Run with: python app.py
 """
 
 import gradio as gr
 from engine import engine
 import os
+import tempfile
 
 
 def load_model_from_url(model_url: str):
@@ -15,7 +16,6 @@ def load_model_from_url(model_url: str):
         return "⚠️ Veuillez entrer un repo ID Hugging Face ou un chemin de modèle.", ""
     try:
         engine.set_model(model_url.strip())
-        # Save path to env var for persistence across restarts
         os.environ["CHAT_MODEL_PATH"] = model_url.strip()
         return f"✅ Modèle chargé : {model_url.strip()}", model_url.strip()
     except Exception as e:
@@ -23,18 +23,38 @@ def load_model_from_url(model_url: str):
 
 
 def load_conversation_list():
-    """Load conversation list for dropdown."""
+    """Load conversation list for dropdown. Returns (choices, selected_id)."""
     rows = engine.list_conversations()
     choices = [(f"{r[1]} (ID: {r[0]})", r[0]) for r in rows]
     if not choices:
         cid = engine.new_conversation()
-        return [(f"New Conversation (ID: {cid})", cid)], cid
+        rows = engine.list_conversations()
+        choices = [(f"{r[1]} (ID: {r[0]})", r[0]) for r in rows]
+        if not choices:
+            return [], None
     return choices, choices[0][1]
 
 
-def on_select_conversation(cid: int, history):
+def dropdown_update(choices, cid):
+    """Update atomique choices+value (évite 'Value not in choices')."""
+    values = [v for _, v in choices]
+    if cid not in values:
+        cid = values[0] if values else None
+    return gr.Dropdown(choices=choices, value=cid)
+
+
+def on_select_conversation(cid, history):
     """Load conversation history when selecting from dropdown."""
-    messages = engine.load_conversation(cid)
+    if cid is None:
+        return []
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return history
+    try:
+        messages = engine.load_conversation(cid)
+    except Exception as e:
+        return history + [{"role": "assistant", "content": f"⚠️ Impossible de charger : {e}"}]
     return [
         {"role": m.role, "content": m.content}
         for m in messages
@@ -42,22 +62,126 @@ def on_select_conversation(cid: int, history):
     ]
 
 
-def chat_stream(message: str, history: list, cid: int, temp: float, max_tok: int, top_p: float, rep: float):
-    """Stream chat response token by token."""
+def refresh_conv_list():
+    choices, cid = load_conversation_list()
+    hist = on_select_conversation(cid, [])
+    return dropdown_update(choices, cid), hist
+
+
+def create_new_conv():
+    engine.new_conversation()
+    return refresh_conv_list()
+
+
+def delete_current_conv(cid):
+    if cid is not None:
+        try:
+            engine.delete_conversation(int(cid))
+        except (TypeError, ValueError):
+            pass
+    return refresh_conv_list()
+
+
+def _ensure_cid(cid):
     if cid is None:
-        cid = engine.new_conversation()
+        return engine.new_conversation()
+    try:
+        return int(cid)
+    except (TypeError, ValueError):
+        return engine.new_conversation()
+
+
+def on_submit(message, history, cid, temp, max_tok, top_p, rep):
+    """Submission avec streaming + gestion d'erreurs."""
+    if history is None:
+        history = []
+    if not message or not message.strip():
+        choices, current = load_conversation_list()
+        if cid in [v for _, v in choices]:
+            current = cid
+        yield history, dropdown_update(choices, current), ""
+        return
+    if ".png" in message or ".jpg" in message or message.startswith("http"):
+        choices, current = load_conversation_list()
+        if cid in [v for _, v in choices]:
+            current = cid
+        yield history, dropdown_update(choices, current), ""
+        return
+
+    cid = _ensure_cid(cid)
+    history = history + [{"role": "user", "content": message}]
+    choices, _ = load_conversation_list()
+    if cid not in [v for _, v in choices]:
+        choices, cid = load_conversation_list()
+        cid = _ensure_cid(cid)
+    yield history, dropdown_update(choices, cid), ""
 
     full = ""
-    for chunk in engine.stream_chat(
-        conversation_id=cid,
-        user_text=message,
-        temperature=temp,
-        max_tokens=max_tok,
-        top_p=top_p,
-        repeat_penalty=rep,
-    ):
-        full += chunk
-        yield history + [{"role": "assistant", "content": full}], cid
+    try:
+        for chunk in engine.stream_chat(
+            conversation_id=cid,
+            user_text=message,
+            temperature=temp,
+            max_tokens=max_tok,
+            top_p=top_p,
+            repeat_penalty=rep,
+        ):
+            full += chunk
+            yield history + [{"role": "assistant", "content": full}], dropdown_update(choices, cid), ""
+    except Exception as e:
+        full += f"\n\n❌ Erreur : {e}"
+        yield history + [{"role": "assistant", "content": full}], dropdown_update(choices, cid), ""
+        return
+
+    choices, _ = load_conversation_list()
+    yield history + [{"role": "assistant", "content": full}], dropdown_update(choices, cid), ""
+
+
+def on_regen(history, cid, temp, max_tok, top_p, rep):
+    """Régénère la dernière réponse sans réécrire le prompt."""
+    if history is None:
+        history = []
+    if cid is None:
+        yield history, dropdown_update(*load_conversation_list())
+        return
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        yield history, dropdown_update(*load_conversation_list())
+        return
+    # Retire la dernière réponse assistant de l'affichage
+    base = list(history)
+    if base and base[-1].get("role") == "assistant":
+        base = base[:-1]
+    yield base, dropdown_update(*load_conversation_list())
+    full = ""
+    try:
+        for chunk in engine.regenerate_last(
+            conversation_id=cid,
+            temperature=temp,
+            max_tokens=max_tok,
+            top_p=top_p,
+            repeat_penalty=rep,
+        ):
+            full += chunk
+            yield base + [{"role": "assistant", "content": full}], dropdown_update(*load_conversation_list())
+    except Exception as e:
+        yield base + [{"role": "assistant", "content": f"❌ Erreur régénération : {e}"}], dropdown_update(*load_conversation_list())
+
+
+def on_export(cid):
+    """Exporte la conversation en .md téléchargeable."""
+    if cid is None:
+        return None
+    try:
+        cid = int(cid)
+        text = engine.export_text(cid)
+    except Exception as e:
+        text = f"Erreur export : {e}"
+    fd, path = tempfile.mkstemp(prefix=f"conv_{cid}_", suffix=".md")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
 
 
 CSS = """
@@ -71,6 +195,9 @@ CSS = """
     }
 """
 
+init_choices, init_cid = load_conversation_list()
+init_hist = on_select_conversation(init_cid, []) if init_cid is not None else []
+
 with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     gr.Markdown("# Qwen3-0.6B Local Chat")
     gr.Markdown("A lightweight, 100% Python chat application with persistent history and streaming responses.")
@@ -78,7 +205,12 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### Conversations")
-            conv_dropdown = gr.Dropdown(label="Select Conversation", choices=[], interactive=True)
+            conv_dropdown = gr.Dropdown(
+                label="Select Conversation",
+                choices=init_choices,
+                value=init_cid,
+                interactive=True,
+            )
             new_conv_btn = gr.Button("+ New Conversation", variant="primary")
             del_conv_btn = gr.Button("Delete Conversation", variant="stop")
 
@@ -87,7 +219,6 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
             gr.Markdown("**Backend**: llama-cpp-python")
             gr.Markdown("**Storage**: SQLite")
 
-            # Modèle Hugging Face personnalisé
             gr.Markdown("**Modèle personnalisé**")
             model_url_input = gr.Textbox(
                 label="Repo ID Hugging Face ou chemin de modèle",
@@ -103,37 +234,36 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
                         "<span style='font-size: 0.7em; color: #666;'>Env: Debian proot VPS Android</span>")
 
         with gr.Column(scale=3):
-            chatbot = gr.Chatbot(
-                label="Chat",
-                height=500,
-            )
+            chatbot = gr.Chatbot(label="Chat", height=500, value=init_hist)
             msg = gr.Textbox(
                 label="Your Message",
                 placeholder="Type your message here...",
                 lines=2,
                 show_label=True,
             )
+            with gr.Row():
+                send_btn = gr.Button("Envoyer", variant="primary")
+                stop_btn = gr.Button("⏹ Stop", variant="stop")
+                regen_btn = gr.Button("🔄 Régénérer", variant="secondary")
+                export_btn = gr.Button("⬇ Exporter", variant="secondary")
+            export_file = gr.File(label="Export .md", interactive=False)
 
             with gr.Accordion("Advanced Settings", open=False):
                 temp_slider = gr.Slider(
                     minimum=0, maximum=2, value=0.7, step=0.1,
-                    label="Temperature",
-                    info="Higher = more creative, Lower = more focused"
+                    label="Temperature", info="Higher = more creative, Lower = more focused"
                 )
                 max_tok_slider = gr.Slider(
                     minimum=64, maximum=2048, value=512, step=64,
-                    label="Max Tokens",
-                    info="Maximum response length"
+                    label="Max Tokens", info="Maximum response length"
                 )
                 top_p_slider = gr.Slider(
                     minimum=0.1, maximum=1, value=0.9, step=0.05,
-                    label="Top P",
-                    info="Nucleus sampling parameter"
+                    label="Top P", info="Nucleus sampling parameter"
                 )
                 rep_slider = gr.Slider(
                     minimum=1, maximum=2, value=1.1, step=0.05,
-                    label="Repeat Penalty",
-                    info="Higher = less repetition"
+                    label="Repeat Penalty", info="Higher = less repetition"
                 )
 
     load_model_btn.click(
@@ -142,73 +272,35 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
         outputs=[model_status, model_url_input],
     )
 
-    def refresh_conv_list():
-        """Refresh conversation dropdown."""
-        choices, cid = load_conversation_list()
-        hist = on_select_conversation(cid, [])
-        return choices, cid, hist
-
-    def create_new_conv():
-        """Create a new conversation."""
-        cid = engine.new_conversation()
-        choices, _ = load_conversation_list()
-        return choices, cid, []
-
-    def delete_current_conv(cid: int):
-        """Delete current conversation."""
-        if cid is not None:
-            engine.delete_conversation(cid)
-        return refresh_conv_list()
-
-    def on_submit(message, history, cid, temp, max_tok, top_p, rep):
-        """Handle message submission."""
-        if not message.strip():
-            return history, cid
-        # Filtrer les messages contenant des images
-        if ".png" in message or ".jpg" in message or message.startswith("http"):
-            return history, cid
-        history = history + [{"role": "user", "content": message}]
-        return chat_stream(message, history, cid, temp, max_tok, top_p, rep)
-
-    init_choices, init_cid = load_conversation_list()
-    init_hist = on_select_conversation(init_cid, [])
-
-    demo.load(
-        fn=lambda: (init_choices, init_cid, init_hist),
-        inputs=[],
-        outputs=[conv_dropdown, conv_dropdown, chatbot],
-    )
-
     conv_dropdown.change(
         fn=on_select_conversation,
         inputs=[conv_dropdown, chatbot],
         outputs=[chatbot],
     )
 
-    new_conv_btn.click(
-        fn=create_new_conv,
-        inputs=[],
-        outputs=[conv_dropdown, conv_dropdown, chatbot],
-    )
+    new_conv_btn.click(fn=create_new_conv, inputs=[], outputs=[conv_dropdown, chatbot])
+    del_conv_btn.click(fn=delete_current_conv, inputs=[conv_dropdown], outputs=[conv_dropdown, chatbot])
 
-    del_conv_btn.click(
-        fn=delete_current_conv,
-        inputs=[conv_dropdown],
-        outputs=[conv_dropdown, conv_dropdown, chatbot],
-    )
-
-    msg.submit(
+    submit_event = msg.submit(
         fn=on_submit,
         inputs=[msg, chatbot, conv_dropdown, temp_slider, max_tok_slider, top_p_slider, rep_slider],
+        outputs=[chatbot, conv_dropdown, msg],
+    )
+    send_event = send_btn.click(
+        fn=on_submit,
+        inputs=[msg, chatbot, conv_dropdown, temp_slider, max_tok_slider, top_p_slider, rep_slider],
+        outputs=[chatbot, conv_dropdown, msg],
+    )
+    # Stop : annule le streaming en cours (ne nécessite aucune fonction)
+    stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[submit_event, send_event])
+
+    regen_btn.click(
+        fn=on_regen,
+        inputs=[chatbot, conv_dropdown, temp_slider, max_tok_slider, top_p_slider, rep_slider],
         outputs=[chatbot, conv_dropdown],
     )
+    export_btn.click(fn=on_export, inputs=[conv_dropdown], outputs=[export_file])
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", "7860"))  # Port par défaut Gradio
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=port,
-        theme=gr.themes.Soft(),
-        css=CSS,
-    )
+    port = int(os.environ.get("PORT", "7860"))
+    demo.launch(server_name="0.0.0.0", server_port=port, theme=gr.themes.Soft(), css=CSS)
