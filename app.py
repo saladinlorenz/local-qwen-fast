@@ -36,7 +36,7 @@ def load_conversation_list():
 
 
 def dropdown_update(choices, cid):
-    """Update atomique choices+value (évite 'Value not in choices')."""
+    """Atomic choices+value update (avoids 'Value not in choices')."""
     values = [v for _, v in choices]
     if cid not in values:
         cid = values[0] if values else None
@@ -63,17 +63,20 @@ def on_select_conversation(cid, history):
 
 
 def refresh_conv_list():
+    """Refresh conversation dropdown. Returns (Dropdown update, history)."""
     choices, cid = load_conversation_list()
     hist = on_select_conversation(cid, [])
     return dropdown_update(choices, cid), hist
 
 
 def create_new_conv():
+    """Create a new conversation."""
     engine.new_conversation()
     return refresh_conv_list()
 
 
 def delete_current_conv(cid):
+    """Delete current conversation."""
     if cid is not None:
         try:
             engine.delete_conversation(int(cid))
@@ -92,7 +95,7 @@ def _ensure_cid(cid):
 
 
 def on_submit(message, history, cid, temp, max_tok, top_p, rep):
-    """Submission avec streaming + gestion d'erreurs."""
+    """Handle message submission (streaming generator)."""
     if history is None:
         history = []
     if not message or not message.strip():
@@ -133,12 +136,13 @@ def on_submit(message, history, cid, temp, max_tok, top_p, rep):
         yield history + [{"role": "assistant", "content": full}], dropdown_update(choices, cid), ""
         return
 
+    # Title may have changed after the first exchange: refresh labels.
     choices, _ = load_conversation_list()
     yield history + [{"role": "assistant", "content": full}], dropdown_update(choices, cid), ""
 
 
 def on_regen(history, cid, temp, max_tok, top_p, rep):
-    """Régénère la dernière réponse sans réécrire le prompt."""
+    """Regenerate the last reply without retyping the prompt."""
     if history is None:
         history = []
     if cid is None:
@@ -149,7 +153,6 @@ def on_regen(history, cid, temp, max_tok, top_p, rep):
     except (TypeError, ValueError):
         yield history, dropdown_update(*load_conversation_list())
         return
-    # Retire la dernière réponse assistant de l'affichage
     base = list(history)
     if base and base[-1].get("role") == "assistant":
         base = base[:-1]
@@ -170,7 +173,7 @@ def on_regen(history, cid, temp, max_tok, top_p, rep):
 
 
 def on_export(cid):
-    """Exporte la conversation en .md téléchargeable."""
+    """Export the conversation as a downloadable .md file."""
     if cid is None:
         return None
     try:
@@ -195,6 +198,9 @@ CSS = """
     }
 """
 
+# Pre-compute initial state BEFORE building components so the Dropdown
+# never starts with choices=[] and an out-of-list value
+# (that race caused "Value: 1 is not in the list of choices: []").
 init_choices, init_cid = load_conversation_list()
 init_hist = on_select_conversation(init_cid, []) if init_cid is not None else []
 
@@ -227,7 +233,12 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
                 scale=4,
             )
             load_model_btn = gr.Button("Charger le modèle", variant="secondary")
-            model_status = gr.Textbox(label="État du modèle", interactive=False, scale=2)
+            model_status = gr.Textbox(
+                label="État du modèle",
+                value="⏳ Modèle chargé à la demande (lazy) — instantané au démarrage.",
+                interactive=False,
+                scale=2,
+            )
 
             gr.Markdown("---")
             gr.Markdown("**Modèle par défaut** : MaziyarPanahi/Qwen3-0.6B-GGUF · "
@@ -272,6 +283,12 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
         outputs=[model_status, model_url_input],
     )
 
+    demo.load(
+        fn=refresh_conv_list,
+        inputs=[],
+        outputs=[conv_dropdown, chatbot],
+    )
+
     conv_dropdown.change(
         fn=on_select_conversation,
         inputs=[conv_dropdown, chatbot],
@@ -291,7 +308,7 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
         inputs=[msg, chatbot, conv_dropdown, temp_slider, max_tok_slider, top_p_slider, rep_slider],
         outputs=[chatbot, conv_dropdown, msg],
     )
-    # Stop : annule le streaming en cours (ne nécessite aucune fonction)
+    # Stop: cancels the running stream (no function needed).
     stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[submit_event, send_event])
 
     regen_btn.click(

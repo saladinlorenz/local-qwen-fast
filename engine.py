@@ -1,9 +1,10 @@
 """
 Core chat engine with SQLite persistence.
 
-- Model loading (llama-cpp-python) optimisé VPS : n_ctx réduit, threads auto
-- System prompt FR + fenêtre glissante (pas de dépassement contexte)
-- SQLite WAL + index
+This module handles:
+- Model loading (llama-cpp-python) — lazy, non-blocking at import (VPS/proot safe)
+- Conversation management (SQLite WAL + index)
+- Streaming chat completions (system prompt FR + sliding window)
 """
 
 import sqlite3
@@ -12,27 +13,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator, Optional, List, Tuple, Dict
 
-from llama_cpp import Llama
-
 import os
 
 DB_PATH = Path(os.getenv("CHAT_DB_PATH", "chat_history.db"))
-_DEFAULT_CANDIDATES = [
-    Path(os.getenv("CHAT_MODEL_PATH", "")) if os.getenv("CHAT_MODEL_PATH") else None,
+
+# Modèle : chemin local / repo HF via CHAT_MODEL_PATH, sinon fichier bundlé, sinon HF.
+# (nom avec points = layout réel du repo MaziyarPanahi, tirets = ancien nom local)
+_LOCAL_CANDIDATES = [
     Path("Qwen3-0.6B-Q4_K_M.gguf"),
     Path("models/Qwen3-0.6B-Q4_K_M.gguf"),
+    Path("Qwen3-0.6B.Q4_K_M.gguf"),
+    Path("models/Qwen3-0.6B.Q4_K_M.gguf"),
 ]
-DEFAULT_MODEL = next((str(p) for p in _DEFAULT_CANDIDATES if p is not None and p.is_file()), "Qwen3-0.6B-Q4_K_M.gguf")
-MODEL_PATH = os.getenv("CHAT_MODEL_PATH", DEFAULT_MODEL)
+MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "") or next(
+    (str(p) for p in _LOCAL_CANDIDATES if p.is_file()), ""
+)
+DEFAULT_REPO = os.getenv("CHAT_MODEL_REPO", "MaziyarPanahi/Qwen3-0.6B-GGUF")
+DEFAULT_FILE = os.getenv("CHAT_MODEL_FILE", "Qwen3-0.6B.Q4_K_M.gguf")
 
 # --- Réglages faciles (env overridable) ---
-N_CTX = int(os.getenv("CHAT_N_CTX", "2048"))  # 4096 -> 2048 = ~2x plus rapide, suffisant pour 0.6B
+N_CTX = int(os.getenv("CHAT_N_CTX", "2048"))  # 2048 ≈ 2x plus rapide que 4096, suffisant pour 0.6B
 N_THREADS = int(os.getenv("CHAT_THREADS", str(os.cpu_count() or 4)))
 N_BATCH = int(os.getenv("CHAT_BATCH", "256"))
-MAX_HISTORY_MESSAGES = int(os.getenv("CHAT_HISTORY", "20"))  # fenêtre glissante
+MAX_HISTORY_MESSAGES = int(os.getenv("CHAT_HISTORY", "20"))  # fenêtre glissante anti-dépassement
 SYSTEM_PROMPT = os.getenv(
     "CHAT_SYSTEM",
-    "Tu es Qwen3, un assistant utile, concis et amical. Réponds en français sauf si l'utilisateur écrit dans une autre langue. Réponses courtes par défaut, détaillées si demandé.",
+    "Tu es Qwen3, un assistant utile, concis et amical. Réponds en français sauf si "
+    "l'utilisateur écrit dans une autre langue. Réponses courtes par défaut, détaillées si demandé.",
 )
 
 
@@ -49,56 +56,66 @@ def _llama_kwargs() -> Dict:
 
 
 class ChatEngine:
-    """Main chat engine class."""
 
     def __init__(self, model_path: Optional[str] = None):
-        if model_path is None:
-            model_path = MODEL_PATH
-        self._model_path = model_path
-        self.llm = self._load_llm(model_path)
+        # Lazy : ne charge PAS le modèle à l'import (pas de crash si absent, démarrage instantané).
+        self._model_path = model_path or MODEL_PATH
+        self.llm = None
+        self._load_error = None
         self._init_db()
 
-    def _load_llm(self, model_path: Optional[str]):
-        kw = _llama_kwargs()
-        if model_path:
-            p = Path(str(model_path))
-            if p.suffix == ".gguf" and not p.is_file():
-                # fichier local manquant -> fallback HF (ex: models/Qwen3-0.6B-Q4_K_M.gguf absent)
-                pass
-            elif p.is_file() or p.suffix == ".gguf":
-                try:
-                    return Llama(model_path=str(model_path), **kw)
-                except Exception:
-                    pass
-            # Repo ID HuggingFace ("user/repo") ou fallback
-            if "/" in str(model_path) and not Path(str(model_path)).exists():
-                # Heuristique : "repo" seul -> repo Qwen par défaut
-                repo = str(model_path)
-                filename = os.getenv("CHAT_MODEL_FILE", "Qwen3-0.6B-Q4_K_M.gguf")
-                try:
-                    return Llama.from_pretrained(repo_id=repo, filename=filename, **kw)
-                except Exception:
-                    pass
-            # Dernier essai : chemin direct (erreur explicite si échec)
-            try:
-                return Llama(model_path=str(model_path), **kw)
-            except Exception:
-                pass
-        return Llama.from_pretrained(
-            repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
-            filename="Qwen3-0.6B-Q4_K_M.gguf",
-            **kw,
-        )
+    def _try_load(self) -> bool:
+        """Attempt to load the model. Returns True on success."""
+        if self.llm is not None:
+            return True
+        try:
+            from llama_cpp import Llama
+            kw = _llama_kwargs()
+            if self._model_path:
+                p = str(self._model_path)
+                if "/" in p and not Path(p).exists():
+                    # Repo ID Hugging Face
+                    try:
+                        self.llm = Llama.from_pretrained(repo_id=p, filename=DEFAULT_FILE, **kw)
+                    except Exception:
+                        self.llm = Llama.from_pretrained(
+                            repo_id=p, filename=DEFAULT_FILE.replace(".", "-"), **kw
+                        )
+                else:
+                    self.llm = Llama(model_path=p, **kw)
+            else:
+                self.llm = Llama.from_pretrained(
+                    repo_id=DEFAULT_REPO,
+                    filename=DEFAULT_FILE,
+                    **kw,
+                )
+            self._model_path = self._model_path or f"{DEFAULT_REPO}/{DEFAULT_FILE}"
+            self._load_error = None
+            return True
+        except Exception as e:
+            self._load_error = str(e)
+            return False
+
+    @property
+    def model_ready(self) -> bool:
+        return self.llm is not None
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._load_error
 
     def set_model(self, model_path: str):
         """Change the model at runtime."""
-        self.llm = self._load_llm(model_path.strip())
         self._model_path = model_path.strip()
+        self.llm = None
+        os.environ["CHAT_MODEL_PATH"] = self._model_path
+        if not self._try_load():
+            raise RuntimeError(self._load_error or "Model loading failed")
 
     # ---------- DB ----------
     def _connect(self):
         conn = sqlite3.connect(DB_PATH)
-        # WAL = lectures non bloquantes (Gradio + API en parallèle), durable et rapide
+        # WAL = lectures non bloquantes (Gradio + API en parallèle)
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
@@ -135,6 +152,7 @@ class ChatEngine:
         conn.close()
 
     def new_conversation(self, title: str = "New Conversation") -> int:
+        """Create a new conversation."""
         conn = self._connect()
         cur = conn.cursor()
         cur.execute(
@@ -147,6 +165,7 @@ class ChatEngine:
         return cid
 
     def load_conversation(self, conversation_id: int, limit: Optional[int] = None) -> List[Message]:
+        """Load messages from a conversation (image refs filtered, text-only model)."""
         conn = self._connect()
         cur = conn.cursor()
         if limit:
@@ -171,6 +190,7 @@ class ChatEngine:
         return out
 
     def save_message(self, conversation_id: int, message: Message):
+        """Save a message to the database (image refs ignored)."""
         if message.content and (".png" in message.content or ".jpg" in message.content or message.content.startswith("http")):
             return
         conn = self._connect()
@@ -183,6 +203,7 @@ class ChatEngine:
         conn.close()
 
     def list_conversations(self) -> List[Tuple[int, str, str]]:
+        """List all conversations."""
         conn = self._connect()
         cur = conn.cursor()
         cur.execute("SELECT id, title, created_at FROM conversations ORDER BY id DESC")
@@ -191,6 +212,7 @@ class ChatEngine:
         return rows
 
     def delete_conversation(self, conversation_id: int):
+        """Delete a conversation and all its messages."""
         conn = self._connect()
         cur = conn.cursor()
         cur.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
@@ -199,6 +221,7 @@ class ChatEngine:
         conn.close()
 
     def update_conversation_title(self, conversation_id: int, title: str):
+        """Update the title of a conversation."""
         conn = self._connect()
         cur = conn.cursor()
         cur.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
@@ -206,6 +229,7 @@ class ChatEngine:
         conn.close()
 
     def export_text(self, conversation_id: int) -> str:
+        """Export a conversation as Markdown."""
         msgs = self.load_conversation(conversation_id)
         lines = [f"# Conversation {conversation_id}", ""]
         for m in msgs:
@@ -214,7 +238,7 @@ class ChatEngine:
 
     # ---------- Inference ----------
     def _build_messages(self, history: List[Message], user_text: str) -> List[Dict]:
-        """System FR + fenêtre glissante anti-dépassement n_ctx."""
+        """System FR + sliding window (never exceeds n_ctx)."""
         window = history[-MAX_HISTORY_MESSAGES:] if len(history) > MAX_HISTORY_MESSAGES else history
         messages: List[Dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         for m in window:
@@ -232,7 +256,11 @@ class ChatEngine:
         top_p: float = 0.9,
         repeat_penalty: float = 1.1,
     ) -> Generator[str, None, None]:
-        """Stream a chat completion. Lève une erreur claire si le modèle échoue."""
+        """Stream a chat completion."""
+        if not self._try_load():
+            yield f"❌ Modèle non chargé : {self._load_error}\n"
+            return
+
         history = self.load_conversation(conversation_id)
         messages = self._build_messages(history, user_text)
 
@@ -277,12 +305,11 @@ class ChatEngine:
         top_p: float = 0.9,
         repeat_penalty: float = 1.1,
     ) -> Generator[str, None, None]:
-        """Supprime la dernière réponse assistant et régénère. Le dernier message user est réutilisé."""
+        """Delete the last assistant reply and re-stream it (reuses last user message)."""
         history = self.load_conversation(conversation_id)
         if not history:
             yield ""
             return
-        # Retire le dernier assistant (et garde le dernier user comme prompt)
         last_user = None
         for m in reversed(history):
             if m.role == "user":
@@ -297,7 +324,6 @@ class ChatEngine:
             "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'assistant')",
             (conversation_id,),
         )
-        # Retire aussi le doublon user qui va être re-sauvé par stream_chat
         cur.execute(
             "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE conversation_id = ? AND role = 'user' AND content = ?)",
             (conversation_id, last_user),

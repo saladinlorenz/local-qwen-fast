@@ -38,12 +38,12 @@
 
 | Fichier | Rôle |
 |---|---|
-| `engine.py` | Chargement modèle, `stream_chat()`, `regenerate_last()`, CRUD SQLite, system prompt FR, fenêtre glissante, `engine` global partagé |
+| `engine.py` | Chargement modèle **lazy** (pas de crash si absent, démarrage instantané), `stream_chat()`, `regenerate_last()`, CRUD SQLite WAL, system prompt FR, fenêtre glissante, `engine` global partagé |
 | `app.py` | UI Gradio : dropdown conversations, chatbot, sliders, boutons Envoyer / Stop / Régénérer / Exporter, chargement modèle |
 | `api.py` | REST : `POST /chat`, `POST /chat/stream` (SSE), `POST /chat/regenerate`, `GET /conversations`, `GET /conversation/{id}/export`, `DELETE /conversation/{id}`, `GET /health`, `GET /docs` |
 | `example_client.py` | Client Python d'exemple (`chat()` + `chat_stream()` SSE) |
 | `models/Qwen3-0.6B-Q4_K_M.gguf` | Modèle local auto-détecté au démarrage |
-| `requirements.txt` | `llama-cpp-python`, `gradio`, `fastapi`, `uvicorn`, `pydantic`, `huggingface_hub` |
+| `requirements.txt` | `llama-cpp-python`, `gradio`, `fastapi`, `uvicorn` (sans `[standard]` : `uvloop` casse proot), `pydantic`, `huggingface_hub` |
 | `setup.bat` / `setup.sh` | Création venv + `pip install -r requirements.txt` |
 | `chat_history.db` | Base SQLite (créée auto, ignorée par git) |
 
