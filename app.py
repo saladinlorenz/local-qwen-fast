@@ -104,7 +104,6 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft(), css="""
             chatbot = gr.Chatbot(
                 label="Chat",
                 height=500,
-                show_copy_button=True,
             )
             msg = gr.Textbox(
                 label="Your Message",
