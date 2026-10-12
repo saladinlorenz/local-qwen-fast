@@ -22,19 +22,31 @@ def load_model_from_url(model_url: str):
         return f"❌ Erreur lors du chargement : {str(e)}", ""
 
 
-def load_conversation_list():
-    """Load conversation list for dropdown."""
+def get_choices():
+    """Return (choices, current_id). Choices are [(label, value), ...]."""
     rows = engine.list_conversations()
-    choices = [(f"{r[1]} (ID: {r[0]})", r[0]) for r in rows]
-    if not choices:
+    if not rows:
         cid = engine.new_conversation()
-        return [(f"New Conversation (ID: {cid})", cid)], cid
-    return choices, choices[0][1]
+        rows = engine.list_conversations()
+    choices = [(f"{r[1]} (ID: {r[0]})", r[0]) for r in rows]
+    cid = choices[0][1]
+    return choices, cid
 
 
-def on_select_conversation(cid: int, history):
+def load_conversation_list():
+    """Load conversation list for dropdown (legacy helper)."""
+    return get_choices()
+
+
+def on_select_conversation(cid, history):
     """Load conversation history when selecting from dropdown."""
-    messages = engine.load_conversation(cid)
+    if cid is None:
+        return []
+    try:
+        cid_int = int(cid)
+    except (TypeError, ValueError):
+        return []
+    messages = engine.load_conversation(cid_int)
     return [
         {"role": m.role, "content": m.content}
         for m in messages
@@ -42,7 +54,7 @@ def on_select_conversation(cid: int, history):
     ]
 
 
-def chat_stream(message: str, history: list, cid: int, temp: float, max_tok: int, top_p: float, rep: float):
+def chat_stream(message: str, history: list, cid, temp: float, max_tok: int, top_p: float, rep: float):
     """Stream chat response token by token."""
     if cid is None:
         cid = engine.new_conversation()
@@ -71,6 +83,12 @@ CSS = """
     }
 """
 
+# Pre-compute initial state BEFORE building components so the Dropdown
+# never starts with choices=[] and a value that is not in the list
+# (that race caused "Value: 1 is not in the list of choices: []").
+init_choices, init_cid = get_choices()
+init_hist = on_select_conversation(init_cid, [])
+
 with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     gr.Markdown("# Qwen3-0.6B Local Chat")
     gr.Markdown("A lightweight, 100% Python chat application with persistent history and streaming responses.")
@@ -78,7 +96,12 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### Conversations")
-            conv_dropdown = gr.Dropdown(label="Select Conversation", choices=[], interactive=True)
+            conv_dropdown = gr.Dropdown(
+                label="Select Conversation",
+                choices=init_choices,
+                value=init_cid,
+                interactive=True,
+            )
             new_conv_btn = gr.Button("+ New Conversation", variant="primary")
             del_conv_btn = gr.Button("Delete Conversation", variant="stop")
 
@@ -106,6 +129,7 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
             chatbot = gr.Chatbot(
                 label="Chat",
                 height=500,
+                value=init_hist,
             )
             msg = gr.Textbox(
                 label="Your Message",
@@ -143,37 +167,79 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     )
 
     def refresh_conv_list():
-        """Refresh conversation dropdown."""
-        choices, cid = load_conversation_list()
+        """Refresh conversation dropdown. Returns (Dropdown update, history)."""
+        choices, cid = get_choices()
         hist = on_select_conversation(cid, [])
-        return choices, cid, hist
+        return gr.Dropdown(choices=choices, value=cid), hist
 
     def create_new_conv():
         """Create a new conversation."""
         cid = engine.new_conversation()
-        choices, _ = load_conversation_list()
-        return choices, cid, []
+        choices, _ = get_choices()
+        # get_choices guarantees the new cid is present
+        return gr.Dropdown(choices=choices, value=cid), []
 
-    def delete_current_conv(cid: int):
+    def delete_current_conv(cid):
         """Delete current conversation."""
         if cid is not None:
-            engine.delete_conversation(cid)
-        return refresh_conv_list()
+            try:
+                engine.delete_conversation(int(cid))
+            except (TypeError, ValueError):
+                pass
+        choices, new_cid = get_choices()
+        hist = on_select_conversation(new_cid, [])
+        return gr.Dropdown(choices=choices, value=new_cid), hist
 
     def on_submit(message, history, cid, temp, max_tok, top_p, rep):
-        """Handle message submission."""
-        if not message.strip():
-            return history, cid
-        history = history + [{"role": "user", "content": message}]
-        return chat_stream(message, history, cid, temp, max_tok, top_p, rep)
-
-    init_choices, init_cid = load_conversation_list()
-    init_hist = on_select_conversation(init_cid, [])
+        """Handle message submission (streaming)."""
+        if not message or not message.strip():
+            yield history or [], cid
+            return
+        history = (history or []) + [{"role": "user", "content": message}]
+        # If no conversation selected yet, create one now so the
+        # Dropdown value stays valid for the whole stream.
+        if cid is None:
+            new_cid = engine.new_conversation()
+            choices, _ = get_choices()
+            dd_static = gr.Dropdown(choices=choices, value=new_cid)
+            cid_eff = new_cid
+        else:
+            dd_static = cid
+            cid_eff = cid
+        full = ""
+        yielded_any = False
+        for chunk in engine.stream_chat(
+            conversation_id=int(cid_eff),
+            user_text=message,
+            temperature=temp,
+            max_tokens=max_tok,
+            top_p=top_p,
+            repeat_penalty=rep,
+        ):
+            full += chunk
+            yielded_any = True
+            yield history + [{"role": "assistant", "content": full}], dd_static
+        if not yielded_any:
+            # stream_chat yielded nothing (e.g. model error message is
+            # yielded as one chunk, so this is just a safety net)
+            yield history, dd_static
+            return
+        # Title may have changed after the first exchange: refresh labels.
+        try:
+            rows = engine.list_conversations()
+            if rows:
+                choices = [(f"{r[1]} (ID: {r[0]})", r[0]) for r in rows]
+                dd_final = gr.Dropdown(choices=choices, value=int(cid_eff))
+            else:
+                dd_final = dd_static
+        except Exception:
+            dd_final = dd_static
+        yield history + [{"role": "assistant", "content": full}], dd_final
 
     demo.load(
-        fn=lambda: (init_choices, init_cid, init_hist),
+        fn=refresh_conv_list,
         inputs=[],
-        outputs=[conv_dropdown, conv_dropdown, chatbot],
+        outputs=[conv_dropdown, chatbot],
     )
 
     conv_dropdown.change(
@@ -185,13 +251,13 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     new_conv_btn.click(
         fn=create_new_conv,
         inputs=[],
-        outputs=[conv_dropdown, conv_dropdown, chatbot],
+        outputs=[conv_dropdown, chatbot],
     )
 
     del_conv_btn.click(
         fn=delete_current_conv,
         inputs=[conv_dropdown],
-        outputs=[conv_dropdown, conv_dropdown, chatbot],
+        outputs=[conv_dropdown, chatbot],
     )
 
     msg.submit(
