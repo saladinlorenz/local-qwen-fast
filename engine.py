@@ -130,6 +130,9 @@ class ChatEngine:
 
     def save_message(self, conversation_id: int, message: Message):
         """Save a message to the database."""
+        # Filtrer les messages contenant des références image
+        if message.content and (".png" in message.content or ".jpg" in message.content or message.content.startswith("http")):
+            return  # On ignore les messages image
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(

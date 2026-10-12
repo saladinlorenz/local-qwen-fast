@@ -164,6 +164,9 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
         """Handle message submission."""
         if not message.strip():
             return history, cid
+        # Filtrer les messages contenant des images
+        if ".png" in message or ".jpg" in message or message.startswith("http"):
+            return history, cid
         history = history + [{"role": "user", "content": message}]
         return chat_stream(message, history, cid, temp, max_tok, top_p, rep)
 
