@@ -60,7 +60,7 @@ def chat_stream(message: str, history: list, cid: int, temp: float, max_tok: int
         yield history + [{"role": "assistant", "content": full}], cid
 
 
-with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft(), css="""
+CSS = """
     .gradio-container {
         max-width: 100% !important;
     }
@@ -69,7 +69,9 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft(), css="""
             flex-direction: column-reverse !important;
         }
     }
-""") as demo:
+"""
+
+with gr.Blocks(title="Qwen3-0.6B Local Chat") as demo:
     gr.Markdown("# Qwen3-0.6B Local Chat")
     gr.Markdown("A lightweight, 100% Python chat application with persistent history and streaming responses.")
 
@@ -199,4 +201,11 @@ with gr.Blocks(title="Qwen3-0.6B Local Chat", theme=gr.themes.Soft(), css="""
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    import os
+    port = int(os.environ.get("PORT", "8000"))
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        theme=gr.themes.Soft(),
+        css=CSS,
+    )
