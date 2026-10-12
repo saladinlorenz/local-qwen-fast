@@ -2,134 +2,110 @@
 Core chat engine with SQLite persistence.
 
 This module handles:
-- Model loading (llama-cpp-python)
+- Model loading (llama-cpp-python) — lazy, non-blocking at import
 - Conversation management (SQLite)
 - Streaming chat completions
 """
 
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Generator, Optional, List, Tuple
 
-from llama_cpp import Llama
-
 import os
 
 DB_PATH = Path(os.getenv("CHAT_DB_PATH", "chat_history.db"))
 MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "")
+DEFAULT_REPO = "MaziyarPanahi/Qwen3-0.6B-GGUF"
+DEFAULT_FILE = "Qwen3-0.6B.Q4_K_M.gguf"
 
 
 @dataclass
 class Message:
-    """Represents a single chat message."""
     role: str
     content: str
     timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
 class ChatEngine:
-    """
-    Main chat engine class.
-
-    Handles model inference, conversation storage, and message streaming.
-    """
 
     def __init__(self, model_path: Optional[str] = None):
-        """
-        Initialize the chat engine.
-
-        Args:
-            model_path: Path to GGUF model file or Hugging Face repo ID.
-                       If None, uses env var CHAT_MODEL_PATH or default Qwen3-0.6B.
-        """
-        # Use environment variable if no explicit path given
-        if model_path is None:
-            model_path = MODEL_PATH
-
-        if model_path:
-            self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
-        else:
-            self.llm = Llama.from_pretrained(
-                repo_id="MaziyarPanahi/Qwen3-0.6B-GGUF",
-                filename="Qwen3-0.6B.Q4_K_M.gguf",
-                n_ctx=4096,
-                verbose=False,
-            )
-        self._model_path = model_path
+        self._model_path = model_path or MODEL_PATH
+        self.llm = None
+        self._load_error = None
         self._init_db()
 
+    def _try_load(self):
+        """Attempt to load the model. Returns True on success."""
+        if self.llm is not None:
+            return True
+        try:
+            from llama_cpp import Llama
+            if self._model_path:
+                self.llm = Llama(model_path=self._model_path, n_ctx=4096, verbose=False)
+            else:
+                self.llm = Llama.from_pretrained(
+                    repo_id=DEFAULT_REPO,
+                    filename=DEFAULT_FILE,
+                    n_ctx=4096,
+                    verbose=False,
+                )
+            self._load_error = None
+            return True
+        except Exception as e:
+            self._load_error = str(e)
+            return False
+
+    @property
+    def model_ready(self) -> bool:
+        return self.llm is not None
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._load_error
+
     def set_model(self, model_path: str):
-        """Change the model at runtime."""
-        self.llm = Llama(model_path=model_path, n_ctx=4096, verbose=False)
         self._model_path = model_path
+        self.llm = None
+        os.environ["CHAT_MODEL_PATH"] = model_path
+        if not self._try_load():
+            raise RuntimeError(self._load_error or "Model loading failed")
 
     def _init_db(self):
-        """Initialize SQLite database with required tables."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT,
-                created_at TEXT
-            )
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id INTEGER,
-                role TEXT,
-                content TEXT,
-                timestamp TEXT,
-                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-            )
-        """)
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, created_at TEXT)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER, role TEXT, content TEXT, timestamp TEXT, FOREIGN KEY (conversation_id) REFERENCES conversations(id))""")
         conn.commit()
         conn.close()
 
     def new_conversation(self, title: str = "New Conversation") -> int:
-        """Create a new conversation."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO conversations (title, created_at) VALUES (?, ?)",
-            (title, datetime.utcnow().isoformat()),
-        )
+        cur.execute("INSERT INTO conversations (title, created_at) VALUES (?, ?)", (title, datetime.utcnow().isoformat()))
         cid = cur.lastrowid
         conn.commit()
         conn.close()
         return cid
 
     def load_conversation(self, conversation_id: int) -> List[Message]:
-        """Load all messages from a conversation."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id",
-            (conversation_id,),
-        )
+        cur.execute("SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY id", (conversation_id,))
         rows = cur.fetchall()
         conn.close()
         return [Message(role=r[0], content=r[1], timestamp=r[2]) for r in rows]
 
     def save_message(self, conversation_id: int, message: Message):
-        """Save a message to the database."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (conversation_id, message.role, message.content, message.timestamp),
-        )
+        cur.execute("INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?, ?, ?, ?)", (conversation_id, message.role, message.content, message.timestamp))
         conn.commit()
         conn.close()
 
     def list_conversations(self) -> List[Tuple[int, str, str]]:
-        """List all conversations."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("SELECT id, title, created_at FROM conversations ORDER BY id DESC")
@@ -138,7 +114,6 @@ class ChatEngine:
         return rows
 
     def delete_conversation(self, conversation_id: int):
-        """Delete a conversation and all its messages."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
@@ -147,29 +122,19 @@ class ChatEngine:
         conn.close()
 
     def update_conversation_title(self, conversation_id: int, title: str):
-        """Update the title of a conversation."""
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE conversations SET title = ? WHERE id = ?",
-            (title, conversation_id),
-        )
+        cur.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
         conn.commit()
         conn.close()
 
-    def stream_chat(
-        self,
-        conversation_id: int,
-        user_text: str,
-        temperature: float = 0.7,
-        max_tokens: int = 512,
-        top_p: float = 0.9,
-        repeat_penalty: float = 1.1,
-    ) -> Generator[str, None, None]:
-        """Stream a chat completion."""
+    def stream_chat(self, conversation_id: int, user_text: str, temperature: float = 0.7, max_tokens: int = 512, top_p: float = 0.9, repeat_penalty: float = 1.1) -> Generator[str, None, None]:
+        if not self._try_load():
+            yield f"❌ Modèle non chargé : {self._load_error}\n"
+            return
+
         history = self.load_conversation(conversation_id)
         messages = [{"role": m.role, "content": m.content} for m in history]
-
         user_msg = Message(role="user", content=user_text)
         messages.append({"role": "user", "content": user_text})
         self.save_message(conversation_id, user_msg)
@@ -178,14 +143,7 @@ class ChatEngine:
             title = user_text[:50] + ("..." if len(user_text) > 50 else "")
             self.update_conversation_title(conversation_id, title)
 
-        completion = self.llm.create_chat_completion(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-            repeat_penalty=repeat_penalty,
-            stream=True,
-        )
+        completion = self.llm.create_chat_completion(messages=messages, temperature=temperature, max_tokens=max_tokens, top_p=top_p, repeat_penalty=repeat_penalty, stream=True)
 
         full_answer = ""
         for part in completion:
