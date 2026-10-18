@@ -9,18 +9,26 @@ Run: python3 app.py   (listens on 0.0.0.0:$PORT, default 8000)
 """
 
 import os
+import json
 import time
 import uuid
+import socket
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from engine import engine
+from webui import PAGE
 
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen3-0.6B")
 MODEL_ID = os.getenv("CHAT_MODEL_PATH") or "Qwen3-0.6B.Q4_K_M.gguf"
+
+# Unique marker returned by ``next(gen, marker)`` when a stream is exhausted.
+_STREAM_END = object()
+
 
 
 @asynccontextmanager
@@ -46,17 +54,14 @@ app = FastAPI(
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return (
-        "<html><body style='font-family:sans-serif;background:#0f172a;"
-        "color:#fff;padding:2rem'>"
-        "<h1>Qwen3-0.6B Local API</h1>"
-        "<p>OpenAI-compatible endpoint: <code>POST /v1/chat/completions</code></p>"
-        "<p>Other endpoints: <code>/v1/models</code>, <code>/health</code>, "
-        "<code>/chat</code>, <code>/conversations</code></p>"
-        "<p>Chat UI (secondary): <a href='/ui' style='color:#7dd3fc'>/ui</a></p>"
-        "<p>Docs: <a href='/docs' style='color:#7dd3fc'>/docs</a></p>"
-        "</body></html>"
-    )
+    # Single-page UI (Chat / Historique / Config). The OpenAI API stays the
+    # primary surface; this page is just a thin client over it.
+    return PAGE
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui_page():
+    return PAGE
 
 
 @app.get("/health")
@@ -107,7 +112,9 @@ async def chat_completions(request: Request):
 
     if not stream:
         try:
-            content = engine.chat(messages, temperature, max_tokens, top_p, repeat_penalty)
+            content = await run_in_threadpool(
+                engine.chat, messages, temperature, max_tokens, top_p, repeat_penalty
+            )
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
         return {
@@ -129,9 +136,25 @@ async def chat_completions(request: Request):
             },
         }
 
-    def event_stream():
+    async def event_stream():
+        gen = engine.chat_stream(messages, temperature, max_tokens, top_p, repeat_penalty)
+        disconnected = False
+        since_check = 0
         try:
-            for token in engine.chat_stream(messages, temperature, max_tokens, top_p, repeat_penalty):
+            while True:
+                # Detect a dropped client so the engine can abort generation
+                # instead of running to the full max_tokens budget on a dead
+                # socket. Probing every token costs an extra receive() per
+                # token; every 16 (~1.5s at 10 tok/s) is responsive enough.
+                if since_check <= 0:
+                    if await request.is_disconnected():
+                        disconnected = True
+                        break
+                    since_check = 16
+                since_check -= 1
+                token = await run_in_threadpool(next, gen, _STREAM_END)
+                if token is _STREAM_END:
+                    break
                 chunk = {
                     "id": cid,
                     "object": "chat.completion.chunk",
@@ -141,23 +164,32 @@ async def chat_completions(request: Request):
                         {"index": 0, "delta": {"content": token}, "finish_reason": None}
                     ],
                 }
-                import json
                 yield f"data: {json.dumps(chunk)}\n\n"
-            final = {
-                "id": cid,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            import json
-            yield f"data: {json.dumps(final)}\n\n"
-            yield "data: [DONE]\n\n"
+            if not disconnected:
+                final = {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(final)}\n\n"
+                yield "data: [DONE]\n\n"
+        except GeneratorExit:
+            disconnected = True
+            raise  # client disconnected: finally below closes `gen`
         except Exception as e:
-            import json
             err = {"error": {"message": str(e)}}
             yield f"data: {json.dumps(err)}\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            # `gen` holds the generation lock: close it deterministically so the
+            # engine aborts the native loop and releases the lock. Relying on GC
+            # leaks the lock when a client disconnects early.
+            try:
+                await run_in_threadpool(gen.close)
+            except Exception:
+                pass
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -199,16 +231,125 @@ def delete_conversation(conversation_id: int):
     return {"status": "deleted", "id": conversation_id}
 
 
-# ---- Mount the Gradio UI (SECONDARY) on /ui ----
+# ---- UI JSON/SSE endpoints (thin client for webui.PAGE) ----
+
+def _lan_ip() -> str:
+    """Best-effort LAN address of this device (works inside the chroot).
+
+    ``request.headers['host']`` is useless here: the VPS gateway rewrites the
+    Host header to the loopback address, so we ask the kernel which source IP
+    it would use to reach the internet instead.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return "127.0.0.1"
+
+
+@app.get("/ui/config")
+def ui_config(request: Request):
+    """Everything the Config tab needs, including the LAN API URL to copy."""
+    port = int(os.environ.get("PORT", "8000"))
+    lan_ip = _lan_ip()
+    return {
+        "model_name": MODEL_NAME,
+        "model_path": MODEL_ID,
+        "model_ready": engine.model_ready,
+        "error": engine.last_error,
+        # Direct LAN endpoint, usable from any OpenAI client on the network:
+        # http://<phone-ip>:<port>/v1  (the client derives the proxy URL).
+        "lan_ip": lan_ip,
+        "port": port,
+        "endpoints": ["/v1/chat/completions", "/v1/models", "/health"],
+        "n_threads": int(os.getenv("N_THREADS", "4")),
+        "n_ctx": int(os.getenv("N_CTX", "4096")),
+    }
+
+
+@app.get("/ui/conversation/{conversation_id}")
+def ui_get_conversation(conversation_id: int):
+    msgs = engine.load_conversation(conversation_id)
+    return [{"role": m.role, "content": m.content} for m in msgs if m.role in ("user", "assistant")]
+
+
+@app.post("/ui/chat")
+async def ui_chat(request: Request):
+    """SSE chat that persists to SQLite (so it shows up in Historique)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    message = (body.get("message") or "").strip()
+    if not message:
+        return JSONResponse({"error": "empty message"}, status_code=400)
+    cid = body.get("conversation_id")
+    cid = int(cid) if cid else engine.new_conversation()
+    temp = float(body.get("temperature", 0.7))
+    max_tok = int(body.get("max_tokens", 512))
+    top_p = float(body.get("top_p", 0.9))
+    rep = float(body.get("repeat_penalty", 1.1))
+
+    gen = engine.stream_chat(cid, message, temp, max_tok, top_p, rep)
+
+    async def es():
+        yield f"data: {json.dumps({'conversation_id': cid})}\n\n"
+        since_check = 0
+        try:
+            while True:
+                if since_check <= 0:
+                    if await request.is_disconnected():
+                        break
+                    since_check = 16
+                since_check -= 1
+                tok = await run_in_threadpool(next, gen, _STREAM_END)
+                if tok is _STREAM_END:
+                    break
+                yield f"data: {json.dumps({'token': tok})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            try:
+                await run_in_threadpool(gen.close)
+            except Exception:
+                pass
+
+    return StreamingResponse(es(), media_type="text/event-stream")
+
+
+@app.post("/ui/model")
+async def ui_load_model(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    path = (body.get("model") or "").strip()
+    if not path:
+        return JSONResponse({"error": "empty model"}, status_code=400)
+    try:
+        engine.set_model(path)
+        os.environ["CHAT_MODEL_PATH"] = path
+        return {"ok": True, "model": path}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---- Optional legacy Gradio UI (heavy; disabled unless UI_GRADIO=1) ----
 
 def _mount_ui():
+    if os.environ.get("UI_GRADIO", "0") not in ("1", "true", "True"):
+        return None
     try:
         import gradio as gr
         from ui import demo
-        gr_app = gr.mount_gradio_app(app, demo, path="/ui")
-        return gr_app
+        return gr.mount_gradio_app(app, demo, path="/ui/legacy")
     except Exception as e:
-        print(f"[ui] failed to mount Gradio on /ui: {e}", flush=True)
+        print(f"[ui] failed to mount Gradio on /ui/legacy: {e}", flush=True)
         return None
 
 
