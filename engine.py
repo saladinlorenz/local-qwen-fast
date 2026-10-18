@@ -17,6 +17,7 @@ Performance notes (Android / CPU-only llama.cpp):
 """
 
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -42,6 +43,74 @@ USE_FLASH_ATTN = os.getenv("USE_FLASH_ATTN", "0") not in ("0", "false", "False")
 # Qwen3 "thinking" mode burns hundreds of tokens before answering; for a local
 # 0.6B assistant it is pure latency. Off by default, re-enable with ENABLE_THINKING=1.
 ENABLE_THINKING = os.getenv("ENABLE_THINKING", "0") not in ("0", "false", "False")
+
+# Qwen3 occasionally emits an empty ``<think>\n\n</think>`` preamble even with
+# the ``/no_think`` soft switch; drop it so neither the UI nor the API shows it.
+_THINK_BLOCK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+
+
+def strip_leading_think(text: str) -> str:
+    """Remove a leading Qwen3 ``<think>...</think>`` block from a full answer."""
+    return _THINK_BLOCK_RE.sub("", text, count=1)
+
+
+class _ThinkFilter:
+    """Streaming filter that drops a leading ``<think>...</think>`` block.
+
+    Only ever touches the very start of the answer; everything else passes
+    through untouched. Whitespace/partial prefixes are buffered only until the
+    stream can be classified, so normal answers lose no latency.
+    """
+
+    def __init__(self, strip: bool):
+        self.done = not strip
+        self.decided = not strip
+        self.in_think = False
+        self.drop_ws = False
+        self.buf = ""
+
+    def feed(self, chunk: str) -> str:
+        if self.done:
+            if self.drop_ws:
+                chunk = chunk.lstrip()
+                if not chunk:
+                    return ""
+                self.drop_ws = False
+            return chunk
+        self.buf += chunk
+        head = self.buf.lstrip()
+        if not self.decided:
+            if head.startswith("<think"):
+                self.decided = True
+                self.in_think = True
+            elif "<think".startswith(head):
+                return ""  # ambiguous prefix ("", "<", "<th", ...): keep buffering
+            else:
+                self.decided = True
+                self.in_think = False
+        if self.in_think:
+            if "</think>" in self.buf:
+                after = self.buf.split("</think>", 1)[1]
+                self.buf = ""
+                self.in_think = False
+                self.done = True
+                after = after.lstrip()
+                self.drop_ws = not after
+                return after
+            return ""
+        out, self.buf = self.buf, ""
+        self.done = True
+        return out
+
+    def flush(self) -> str:
+        if self.done:
+            return ""
+        self.done = True
+        if self.in_think:  # unterminated think block at EOF: drop it
+            return ""
+        out, self.buf = self.buf, ""
+        return out
+
 
 
 def _pin_to_fastest_cores() -> int:
@@ -276,7 +345,10 @@ class ChatEngine:
             )
         finally:
             self._gen_lock.release()
-        return completion["choices"][0]["message"]["content"] or ""
+        result = completion["choices"][0]["message"]["content"] or ""
+        if not ENABLE_THINKING:
+            result = strip_leading_think(result)
+        return result
 
     def chat_stream(self, messages: List[dict], temperature: float = 0.7,
                     max_tokens: int = 512, top_p: float = 0.9,
@@ -335,6 +407,7 @@ class ChatEngine:
 
         producer = threading.Thread(target=_producer, name="llama-gen", daemon=True)
         producer.start()
+        think = _ThinkFilter(strip=not ENABLE_THINKING)
         try:
             while True:
                 item = q.get()
@@ -342,7 +415,12 @@ class ChatEngine:
                     break
                 if isinstance(item, BaseException):
                     raise item
-                yield item
+                out = think.feed(item)
+                if out:
+                    yield out
+            tail = think.flush()
+            if tail:
+                yield tail
         except GeneratorExit:
             # Client disconnected: tell the producer to stop at the next token
             # boundary. It releases the lock itself; never release it here.
