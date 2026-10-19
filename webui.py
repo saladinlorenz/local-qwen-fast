@@ -232,6 +232,11 @@ function params(){
            top_p:+$('topp').value, repeat_penalty:+$('rep').value };
 }
 
+/* Served either directly at "/" or through the VPS gateway at "/app/<id>"
+   (with or without a trailing slash). Normalise the base so every API call
+   stays under the mounted prefix instead of escaping to "/app/ui/...". */
+const API_BASE = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/'
+
 /* ---- Chat rendering ---- */
 function clearEmpty(){
   const m = $('messages'); const e = m.querySelector('.empty'); if(e) e.remove();
@@ -264,7 +269,7 @@ async function send(){
   const bot = addMsg('assistant', '');
   bot.innerHTML = '<span style="color:var(--muted)">…</span>';
   try{
-    const res = await fetch('ui/chat', {
+    const res = await fetch(API_BASE + 'ui/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({ conversation_id: currentCid, message: text }, params()))
     });
@@ -310,7 +315,7 @@ $('newChat').addEventListener('click', ()=>{
 async function loadHistory(){
   const box = $('convList'); box.innerHTML = '<div class="hint">Chargement…</div>';
   try{
-    const rows = await (await fetch('conversations')).json();
+    const rows = await (await fetch(API_BASE + 'conversations')).json();
     if(!rows.length){ box.innerHTML = '<div class="hint">Aucune conversation.</div>'; return; }
     box.innerHTML = '';
     for(const c of rows){
@@ -323,13 +328,13 @@ async function loadHistory(){
       del.addEventListener('click', async (e)=>{
         e.stopPropagation();
         if(!confirm('Supprimer cette conversation ?')) return;
-        await fetch('conversation/'+c.id, {method:'DELETE'});
+        await fetch(API_BASE + 'conversation/'+c.id, {method:'DELETE'});
         if(currentCid===c.id){ currentCid=null; renderConversation([]); }
         loadHistory(); toast('Supprimée');
       });
       d.appendChild(del);
       d.addEventListener('click', async ()=>{
-        const msgs = await (await fetch('ui/conversation/'+c.id)).json();
+        const msgs = await (await fetch(API_BASE + 'ui/conversation/'+c.id)).json();
         currentCid = c.id; renderConversation(msgs); show('chat');
       });
       box.appendChild(d);
@@ -340,9 +345,9 @@ async function loadHistory(){
 /* ---- Config ---- */
 async function loadConfig(){
   try{
-    const cfg = await (await fetch('ui/config')).json();
+    const cfg = await (await fetch(API_BASE + 'ui/config')).json();
     $('apiDirect').textContent = 'http://' + cfg.lan_ip + ':' + cfg.port + '/v1';
-    $('apiProxy').textContent = location.origin + location.pathname.replace(/\/+$/, '') + '/v1';
+    $('apiProxy').textContent = location.origin + API_BASE + 'v1';
     $('apiModel').textContent = cfg.model_name;
     $('curModel').textContent = cfg.model_path;
     $('curState').textContent = cfg.model_ready ? 'prêt' : 'chargement…';
@@ -355,7 +360,7 @@ $('loadModel').addEventListener('click', async ()=>{
   if(!model){ toast('Indique un repo ou un chemin'); return; }
   $('modelMsg').textContent = 'Chargement…';
   try{
-    const r = await fetch('ui/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model})});
+    const r = await fetch(API_BASE + 'ui/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model})});
     const j = await r.json();
     if(j.ok){ $('modelMsg').textContent = '✅ ' + j.model; loadConfig(); }
     else{ $('modelMsg').textContent = '❌ ' + (j.error||'erreur'); }
@@ -365,7 +370,7 @@ $('loadModel').addEventListener('click', async ()=>{
 /* ---- Status + boot ---- */
 async function refreshStatus(){
   try{
-    const h = await (await fetch('health')).json();
+    const h = await (await fetch(API_BASE + 'health')).json();
     const ready = h.model_ready;
     $('statusDot').className = 'dot ' + (ready?'ok':'err');
     $('statusText').textContent = ready ? 'Modèle prêt' : ('Chargement… ' + (h.error||''));
