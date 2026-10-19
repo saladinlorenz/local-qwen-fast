@@ -13,6 +13,7 @@ import json
 import time
 import uuid
 import socket
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -69,7 +70,7 @@ def ui_page():
 def health():
     return {
         "status": "healthy" if engine.model_ready else "loading",
-        "model": MODEL_ID,
+        "model": engine.current_model,
         "model_ready": engine.model_ready,
         "error": engine.last_error,
     }
@@ -258,8 +259,9 @@ def ui_config(request: Request):
     port = int(os.environ.get("PORT", "8000"))
     lan_ip = _lan_ip()
     return {
-        "model_name": MODEL_NAME,
-        "model_path": MODEL_ID,
+        "model_name": os.path.splitext(engine.current_model)[0],
+        "model_path": engine.current_model,
+        "model_current": engine.current_model,
         "model_ready": engine.model_ready,
         "error": engine.last_error,
         # Direct LAN endpoint, usable from any OpenAI client on the network:
@@ -323,6 +325,50 @@ async def ui_chat(request: Request):
     return StreamingResponse(es(), media_type="text/event-stream")
 
 
+def _model_roots():
+    """Directories that may hold GGUF files inside the chroot."""
+    home = os.path.expanduser("~")
+    roots = ["/root/models", os.path.join(home, ".cache/huggingface/hub"),
+             "/.cache/huggingface/hub", "/root/.cache/huggingface/hub"]
+    out = []
+    for r in roots:
+        p = Path(r)
+        if p.is_dir() and p not in out:
+            out.append(p)
+    return out
+
+
+def _local_models():
+    """List the GGUF files already present on the device."""
+    seen = {}
+    for root in _model_roots():
+        for f in root.rglob("*.gguf"):
+            try:
+                if not f.is_file():
+                    continue
+                real = os.path.realpath(str(f))
+                if real not in seen:
+                    seen[real] = (str(f), f.stat().st_size)
+            except OSError:
+                continue
+    cur = os.getenv("CHAT_MODEL_PATH", "")
+    cur_base = os.path.basename(cur) if cur else os.getenv("CHAT_MODEL_FILE", "")
+    items = []
+    for _real, (path, size) in sorted(seen.items(), key=lambda kv: os.path.basename(kv[1][0])):
+        items.append({
+            "label": os.path.basename(path),
+            "path": path,
+            "size_mb": round(size / 1048576, 1),
+            "current": os.path.basename(path) == cur_base,
+        })
+    return items
+
+
+@app.get("/ui/models")
+def ui_models():
+    return _local_models()
+
+
 @app.post("/ui/model")
 async def ui_load_model(request: Request):
     try:
@@ -332,10 +378,34 @@ async def ui_load_model(request: Request):
     path = (body.get("model") or "").strip()
     if not path:
         return JSONResponse({"error": "empty model"}, status_code=400)
+    # Accept either a local .gguf path or a Hugging Face repo id
+    # ("owner/repo" or "owner/repo/file.gguf"); repos are resolved through the
+    # HF cache, so the same endpoint powers the picker and manual entry.
+    resolved = path
+    if not os.path.exists(path) and not path.startswith("/"):
+        try:
+            from huggingface_hub import hf_hub_download, list_repo_files
+            parts = path.split("/")
+            if len(parts) >= 3 and parts[-1].endswith(".gguf"):
+                repo, filename = "/".join(parts[:2]), "/".join(parts[2:])
+            elif len(parts) == 2:
+                repo, filename = path, ""
+            else:
+                repo, filename = "", ""
+            if not repo:
+                return JSONResponse({"error": "chemin local introuvable"}, status_code=400)
+            if not filename:
+                ggufs = [f for f in list_repo_files(repo) if f.endswith(".gguf")]
+                if not ggufs:
+                    return JSONResponse({"error": "aucun GGUF dans ce repo"}, status_code=400)
+                filename = ggufs[0]
+            resolved = hf_hub_download(repo_id=repo, filename=filename)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": f"repo introuvable: {e}"}, status_code=400)
     try:
-        engine.set_model(path)
-        os.environ["CHAT_MODEL_PATH"] = path
-        return {"ok": True, "model": path}
+        engine.set_model(resolved)
+        os.environ["CHAT_MODEL_PATH"] = resolved
+        return {"ok": True, "model": os.path.basename(resolved)}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

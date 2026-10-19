@@ -256,6 +256,11 @@ class ChatEngine:
         return self.llm is not None
 
     @property
+    def current_model(self) -> str:
+        """File name of the loaded model (path or auto-downloaded default)."""
+        return os.path.basename(self._model_path) if self._model_path else DEFAULT_FILE
+
+    @property
     def last_error(self) -> Optional[str]:
         return self._load_error
 

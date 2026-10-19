@@ -167,8 +167,10 @@ PAGE = r"""<!DOCTYPE html>
           <span class="k">État</span><span id="curState">…</span>
           <span class="k">Threads / ctx</span><span id="curThreads">…</span>
         </div>
-        <label>Repo ID ou chemin</label>
-        <input type="text" id="modelInput" placeholder="ex: MaziyarPanahi/Qwen3-0.6B-GGUF ou /root/models/xxx.gguf">
+        <label>Modèle disponible sur l'appareil</label>
+        <select id="modelSelect"></select>
+        <label>Ou repo ID / chemin</label>
+        <input type="text" id="modelInput" placeholder="ex: ggml-org/gemma-3-1b-it-GGUF ou /root/models/xxx.gguf">
         <div class="row" style="margin-top:12px">
           <button class="primary" id="loadModel">Charger</button>
           <span id="modelMsg" style="color:var(--muted);font-size:13px"></span>
@@ -349,20 +351,42 @@ async function loadConfig(){
     $('apiDirect').textContent = 'http://' + cfg.lan_ip + ':' + cfg.port + '/v1';
     $('apiProxy').textContent = location.origin + API_BASE + 'v1';
     $('apiModel').textContent = cfg.model_name;
-    $('curModel').textContent = cfg.model_path;
+    $('curModel').textContent = cfg.model_current || cfg.model_path;
     $('curState').textContent = cfg.model_ready ? 'prêt' : 'chargement…';
     $('curThreads').textContent = cfg.n_threads + ' / ' + cfg.n_ctx;
     $('hdrModel').textContent = '· ' + cfg.model_name;
   }catch(e){ toast('Config indisponible'); }
 }
+
+/* List the GGUF files already on the device so switching is one click. */
+async function loadModels(){
+  try{
+    const rows = await (await fetch(API_BASE + 'ui/models')).json();
+    const sel = $('modelSelect');
+    sel.innerHTML = '';
+    if(!rows.length){
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = '(aucun modèle local)';
+      sel.appendChild(o);
+      return;
+    }
+    for(const m of rows){
+      const o = document.createElement('option');
+      o.value = m.path;
+      o.textContent = m.label + '  (' + m.size_mb + ' Mo)' + (m.current ? '  ✓ actuel' : '');
+      sel.appendChild(o);
+    }
+  }catch(e){ /* keep the manual input usable */ }
+}
+
 $('loadModel').addEventListener('click', async ()=>{
-  const model = $('modelInput').value.trim();
-  if(!model){ toast('Indique un repo ou un chemin'); return; }
+  const model = $('modelInput').value.trim() || $('modelSelect').value;
+  if(!model){ toast('Choisis un modèle ou indique un repo/chemin'); return; }
   $('modelMsg').textContent = 'Chargement…';
   try{
     const r = await fetch(API_BASE + 'ui/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model})});
     const j = await r.json();
-    if(j.ok){ $('modelMsg').textContent = '✅ ' + j.model; loadConfig(); }
+    if(j.ok){ $('modelMsg').textContent = '✅ ' + j.model; $('modelInput').value=''; loadConfig(); loadModels(); refreshStatus(); }
     else{ $('modelMsg').textContent = '❌ ' + (j.error||'erreur'); }
   }catch(e){ $('modelMsg').textContent = '❌ ' + e.message; }
 });
@@ -377,6 +401,7 @@ async function refreshStatus(){
   }catch(e){ $('statusDot').className='dot err'; $('statusText').textContent='Serveur injoignable'; }
 }
 loadSettings();
+loadModels();
 refreshStatus(); setInterval(refreshStatus, 8000);
 $('input').focus();
 </script>
