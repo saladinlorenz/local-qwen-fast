@@ -24,7 +24,8 @@ from engine import engine
 from webui import PAGE
 
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen3-0.6B")
-MODEL_ID = os.getenv("CHAT_MODEL_PATH") or "Qwen3-0.6B.Q4_K_M.gguf"
+MODEL_ID = (os.getenv("CHAT_MODEL_PATH") or os.getenv("CHAT_MODEL_FILE")
+            or "Qwen3-0.6B.Q4_K_M.gguf")
 
 # Unique marker returned by ``next(gen, marker)`` when a stream is exhausted.
 _STREAM_END = object()
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Qwen3-0.6B Local API",
+    title=f"{MODEL_NAME} Local API",
     description="Local LLM API (OpenAI-compatible) with optional Gradio UI on /ui",
     version="1.1.0",
     lifespan=lifespan,

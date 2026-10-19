@@ -28,8 +28,8 @@ from typing import Generator, Optional, List, Tuple
 
 DB_PATH = Path(os.getenv("CHAT_DB_PATH", "chat_history.db"))
 MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "")
-DEFAULT_REPO = "MaziyarPanahi/Qwen3-0.6B-GGUF"
-DEFAULT_FILE = "Qwen3-0.6B.Q4_K_M.gguf"
+DEFAULT_REPO = os.getenv("CHAT_MODEL_REPO", "MaziyarPanahi/Qwen3-0.6B-GGUF")
+DEFAULT_FILE = os.getenv("CHAT_MODEL_FILE", "Qwen3-0.6B.Q4_K_M.gguf")
 
 # CPU tuning: sensible defaults for a mid-range Android SoC, all overridable.
 N_THREADS = int(os.getenv("N_THREADS", "4"))
